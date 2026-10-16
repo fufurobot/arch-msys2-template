@@ -1,0 +1,140 @@
+name: Migrate and Build AUR Packages for MSYS2
+
+on:
+  # Trigger on pushes to the main branch (or your preferred branch)
+  push:
+    branches: [ main ]
+  # Trigger on a schedule to check for upstream updates
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight
+  # Allow manual triggering for debugging or on-demand builds
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - msystem: MINGW64
+            msystem_prefix: mingw64
+            mingw_package_prefix: mingw-w64-x86_64
+          - msystem: MINGW32
+            msystem_prefix: mingw32
+            mingw_package_prefix: mingw-w64-i686
+          - msystem: UCRT64
+            msystem_prefix: ucrt64
+            mingw_package_prefix: mingw-w64-ucrt-x86_64
+          - msystem: CLANG64
+            msystem_prefix: clang64
+            mingw_package_prefix: mingw-w64-clang-x86_64
+          - msystem: CLANGARM64
+            msystem_prefix: clangarm64
+            mingw_package_prefix: mingw-w64-clang-aarch64
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive # Ensures the upstream submodule inside 'origin' is fetched
+
+      - name: Setup MSYS2 Environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            base-devel
+            git
+            patch
+            mingw-w64-${{ matrix.msystem_prefix }}-toolchain
+            mingw-w64-${{ matrix.msystem_prefix }}-makepkg
+
+      - name: Apply AUR Patches and Pre-Patch Script
+        shell: msys2 {0}
+        run: |
+          #!/bin/bash
+          set -e
+
+          # 1. Execute pre-patch script if it exists
+          if [ -f "pre-patch-msys2.sh" ]; then
+            echo "Executing pre-patch-msys2.sh..."
+            chmod +x pre-patch-msys2.sh
+            ./pre-patch-msys2.sh
+          fi
+
+          # 2. Apply patches from 'patch/' folder matching files in 'origin/'
+          if [ -d "patch" ]; then
+            echo "Scanning for patches in 'patch/' directory..."
+            find patch/ -type f -name "*.patch" | while read -r patch_file; do
+              # Determine the relative path inside 'origin/' based on the patch file's location
+              relative_path="${patch_file#patch/}"
+              target_file="origin/${relative_path}"
+              
+              if [ -f "$target_file" ]; then
+                echo "Applying $patch_file to $target_file"
+                # Use git apply for better handling of git patches, fallback to patch
+                if git apply --directory=origin "$patch_file"; then
+                  echo "Successfully applied via git apply."
+                else
+                  echo "Git apply failed, trying standard patch..."
+                  patch -p1 -d origin < "$patch_file"
+                fi
+              else
+                echo "Target file $target_file not found for patch $patch_file. Skipping."
+              fi
+            done
+          fi
+
+          # 3. Copy any unpatched files from 'origin/' to the repository root
+          # This assumes the PKGBUILD and other build scripts are in the root.
+          if [ -d "origin" ]; then
+            echo "Copying unpatched files from 'origin/'..."
+            # Copy all files, but avoid overwriting existing patch files or scripts
+            cp -r origin/* . 2>/dev/null || true
+          fi
+
+          # 4. Execute post-patch script if it exists
+          if [ -f "post-patch-msys2.sh" ]; then
+            echo "Executing post-patch-msys2.sh..."
+            chmod +x post-patch-msys2.sh
+            ./post-patch-msys2.sh
+          fi
+
+      - name: Build Package with makepkg-mingw
+        shell: msys2 {0}
+        run: |
+          #!/bin/bash
+          set -e
+          
+          # Export the MINGW_PACKAGE_PREFIX to be used by the PKGBUILD or build scripts
+          export MINGW_PACKAGE_PREFIX=${{ matrix.mingw_package_prefix }}
+          export MSYSTEM=${{ matrix.msystem }}
+          
+          echo "Building for $MSYSTEM with prefix $MINGW_PACKAGE_PREFIX"
+          
+          # Ensure the PKGBUILD exists (it should have been copied from origin or patched)
+          if [ ! -f "PKGBUILD" ]; then
+            echo "Error: PKGBUILD not found!"
+            exit 1
+          fi
+
+          # Run makepkg-mingw. 
+          # -s: Install missing dependencies
+          # -C: Clean build directory after building
+          # -L: Log the build
+          # -f: Force rebuild
+          # --noconfirm: Avoid prompts
+          # --noprogressbar: Cleaner logs in CI
+          makepkg-mingw -sCLf --noconfirm --noprogressbar
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: msys2-packages-${{ matrix.msystem }}
+          path: |
+            *.pkg.tar.zst
+            *.pkg.tar.xz
+            *.pkg.tar.gz
+          if-no-files-found: warn
